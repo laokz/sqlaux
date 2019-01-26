@@ -3,5 +3,5 @@
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-!sqlaux_test.go
-!sqlaux.code-workspace
+sqlaux_test.go
+sqlaux.code-workspace
