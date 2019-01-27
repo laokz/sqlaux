@@ -15,15 +15,17 @@ import (
 //
 // 约定与示例:
 //	type T struct {...}
-//	type T1 struct {...}					// 对应数据库表t1
-//	type T2 struct {..., T, ...}			// 可以嵌套struct
+//	type T1 struct {...}				 // 对应数据库表t1
+//	type T2 struct {..., T, ...}		 // 可以嵌套struct
 //	var v1 []*T1; var v2 []*T2
-//	rs, _ := db.Query(`SELECT t1.*,			// 逐表罗列选择列*
+//	rs, _ := db.Query(`SELECT t1.*,		 // 逐表罗列选择列*
 //	         t2.C1,t2.C2 FROM t1,t2...`)
-//	Scan(rs, &v1, &v2)						// dest的类型形如*[]*struct
-//											// 接收参数一一对应SELECT后的表
+//	Scan(rs, &v1, &v2)	 				 // dest的类型形如*[]*struct
+//										 // 接收参数一一对应SELECT后的表**
 // *选择列时，如果两表“交界”处的列名如C1，在T1、T2中有相同的映射名，则Scan 可能将结
 // 果赋予v1而不是v2，为避免这种情况可在表间用空列''分隔，如：SELECT t1.*,'',t2.C1
+// **默认Scan对结构字段名和数据库列名进行大小写不敏感的相等匹配，使用StructMap可以
+// 定制映射关系。
 func Scan(rows *sql.Rows, dest ...interface{}) error {
 	// 创建接收结果的临时变量
 	if len(dest) == 0 {
@@ -104,24 +106,23 @@ func prepareVars(rows *sql.Rows, e ...reflect.Value) ([]interface{}, error) {
 	return r, nil
 }
 
-// StructMap 提供GO struct到数据库表的名称映射。键值串的格式为“xxx.xxx”，对于key表示
-// 的是“结构名.字段名”，对于value表示的是“数据库表名.列名”，其中结构名和数据库表名均可以
-// 为空，表示不做限制，字段必须为导出字段，点.不能省略。系统忽略不合法的映射而不报错。
-// 匹配规则：
+// StructMap 提供GO struct到数据库表的名称映射，默认为nil。键值串的格式为“xxx.xxx”，
+// 对于key表示的是“结构名.字段名”，对于value表示的是“数据库表名.列名”，其中结构名和数
+// 据库表名均可以为空，表示不做限制，字段必须为导出字段，点.不能省略。系统忽略不合法的映
+// 射而不报错。匹配规则：
 //	1. 查找指定的“结构名.字段名”的映射
 //	2. 查找不限制结构名的“.字段名”的映射
-//	3. 对于映射值，如为期望的“表名.列名”或“.列名”，则找到
-//
-// 调用者未初始化并填充该变量时，系统使用“字段名与列名首次严格匹配”的模式进行映射。
-// StructMap 能解决GO数据结构与数据库表列名称不一致的问题，但不能解决SELECT选择列歧义问
-// 题，见Scan注释。
+//	3. 对于有映射的，如为期望的“表名.列名”或“.列名”，则成功，否则失败
+//  4. 对于没有映射的，对“字段名”和“列名”进行大小写不敏感的相等匹配
 //
 // 注意：如无特别配置，*sql.Rows.Columns()不包含表名，因此通常不应限制映射的表名。
+// StructMap 能解决GO数据结构与数据库表列名称不一致的问题，但不能解决SELECT选择列歧义问
+// 题，见Scan注释。
 var StructMap map[string]string
 
 // getFieldAddr 返回*struct e中与查询结果列名 n对应的导出字段地址，未找到时返回nil。
 // 查找时遍历e的嵌套 struct，包括非匿名struct或* struct。如果StructMap有值，则先查找
-// 这个映射。
+// 这个映射，否则对“字段名”和“列名”进行大小写不敏感的相等匹配。
 func getFieldAddr(n string, e reflect.Value) interface{} {
 	v := reflect.Indirect(e)
 
@@ -137,7 +138,7 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 			return false
 		}
 		if StructMap == nil { // 无映射
-			return field == col
+			return strings.ToLower(field) == strings.ToLower(col)
 		}
 		if tc, ok := StructMap[stru+"."+field]; ok { // 有指定的映射
 			tcs := strings.Split(tc, ".")
@@ -153,7 +154,7 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 				return true
 			}
 		}
-		return field == col
+		return strings.ToLower(field) == strings.ToLower(col)
 	})
 	if f.IsValid() {
 		return f.Addr().Interface()
