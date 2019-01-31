@@ -169,3 +169,152 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 	}
 	return nil
 }
+
+// Buildstr 为单表SQL INSERT和 UPDATE拼接符合规范的（赋）值串。
+// data为与数据库表对应的*struct或 struct变量；field为需要拼接的导出字段名，没有时表示
+// 所有导出字段*；flag为真表示拼接结果是 VALUES形式，否则是 SET形式，即：
+//		VALUES形式：(值1,值2,...)
+//		SET形式：   列名1=值1,列名2=值2,...    // **
+//
+// * Buildstr支持的字段类型包括反射 Kind < Complex64的“简单”类型、reflect.String
+// 和实现了 fmt.Stringer的自定义类型。未实现fmt.Stringer接口的 struct类型成员将递归拼
+// 接，指针类型成员解一级引用再判断。注意：自定义的String()输出要符合数据库的格式要求。
+// ** Buildstr默认将结构字段名转换成小写作为数据库表的列名，使用StructMap可以定制映射关系。
+func Buildstr(flag bool, data interface{}, field ...string) (string, error) {
+	v := reflect.ValueOf(data)
+	if reflect.Indirect(v).Kind() != reflect.Struct {
+		return "", fmt.Errorf("Buildstr: data 必须是与数据库表对应的struct类型变量")
+	}
+
+	var b strings.Builder
+	if err := walkFields(&b, flag, v, field...); err != nil { // 遍历字段
+		return "", err
+	}
+	if flag { // VALUES形式
+		return "(" + b.String()[1:] + ")", nil // 去掉第一个逗号
+	}
+	return b.String()[1:], nil // SET形式
+}
+
+// walkFields 遍历v 的field字段，根据flag标志，将“值串”写入b。
+// field为空时，遍历v的所有简单类型和实现了 fmt.Stringer的自定义类型的导出字段，
+// 未实现fmt.Stringer的 struct类型成员递归遍历，指针类型成员解一级引用再判断。
+//
+// 注意：field为空时对于无法拼接的字段，walkFields只忽略不报错；而field明确的字
+// 段无法拼接时，walkField会报错。
+func walkFields(b *strings.Builder, flag bool, v reflect.Value,
+	field ...string) error {
+	v = reflect.Indirect(v) // 确保是struct，而不是*struct
+	stru := v.Type().Name() // 结构名
+	if len(field) == 0 {    // 遍历所有字段
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Type().Field(i)                   // 第i个成员的属性
+			vv := v.Field(i)                         // 第i个成员的值
+			if !unicode.IsUpper([]rune(f.Name)[0]) { // 跳过非导出字段
+				continue
+			}
+
+			// 拼接简单类型和实现了Stringer接口的类型，以及：
+			if _, ok := vv.Interface().(fmt.Stringer); !ok {
+				// 指针解一级引用再判断。*T未实现的接口 T一定也未实现
+				vvv := reflect.Indirect(vv)
+				if vvv.Kind() >= reflect.Complex64 { // “复杂”类型
+					switch vvv.Kind() {
+					case reflect.String: // 看作简单类型
+						break
+					case reflect.Struct: // 递归遍历
+						walkFields(b, flag, vvv.Addr())
+						continue
+					default:
+						continue // 其它跳过
+					}
+				}
+			}
+			n := f.Name // 字段名
+			s := ""     // 对应的列名
+			if !flag {  // SET形式
+				s = field2col(stru, n) + "="
+			}
+			buildstr(b, s, vv)
+		}
+		return nil
+	}
+next:
+	for _, n := range field { // 部分字段
+		vv := v.FieldByName(n) // 在v及其匿名结构字段中找
+		if vv.IsValid() {
+			_, ok := vv.Interface().(fmt.Stringer)
+			vvv := reflect.Indirect(vv) // 排除无法拼接的情况
+			if !ok && vvv.Kind() >= reflect.Complex64 &&
+				vvv.Kind() != reflect.String {
+				return fmt.Errorf("Buildstr: %s字段无法拼接", n)
+			}
+			s := ""    // 对应的列名
+			if !flag { // SET形式
+				s = field2col(stru, n) + "="
+			}
+			buildstr(b, s, vv)
+			continue
+		}
+		for i := 0; i < v.NumField(); i++ { // 在非匿名结构字段继续找
+			f := v.Type().Field(i)
+			if !unicode.IsUpper([]rune(f.Name)[0]) {
+				continue // 跳过非导出字段
+			}
+			vv := reflect.Indirect(v.Field(i))
+			if vv.Kind() == reflect.Struct && !f.Anonymous {
+				if err := walkFields(b, flag, vv.Addr(), n); err == nil {
+					continue next // 找到
+				}
+			}
+		}
+		return fmt.Errorf("Buildstr: %s字段未找到", n)
+	}
+	return nil
+}
+
+// field2col 返回结构stru的 field字段对应的数据库列名。
+// 默认将字段名转换成小写作为数据库表的列名，使用StructMap可以定制映射关系。
+func field2col(stru, field string) string {
+	s := strings.ToLower(field)
+	if StructMap != nil {
+		if tc, ok := StructMap[stru+"."+field]; ok { // 有指定的映射
+			tcs := strings.Split(tc, ".")
+			if len(tcs) == 2 {
+				s = tcs[1]
+			}
+		} else if tc, ok := StructMap["."+field]; ok { // 有不限制映射
+			tcs := strings.Split(tc, ".")
+			if len(tcs) == 2 {
+				s = tcs[1]
+			}
+		}
+	}
+	return s
+}
+
+// buildstr 向b写入一条符合 SQL规范的（赋）值串。s不为空时写入一条“,s=v的值”，s为空时
+// 写入一条“,v的值”。
+// v可以是实现了 fmt.Stringer接口的类型，及反射Kind为 Bool、Int、Uint、Float、String
+// 的“简单”类型或其指针，其它忽略。
+func buildstr(b *strings.Builder, s string, v reflect.Value) {
+	if f, ok := v.Interface().(fmt.Stringer); ok {
+		fmt.Fprintf(b, ",%s%s", s, f.String())
+		return
+	}
+
+	v = reflect.Indirect(v) // 如果是指针，解引用
+	switch v.Kind() {
+	case reflect.Bool:
+		fmt.Fprintf(b, ",%s%t", s, v.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		fmt.Fprintf(b, ",%s%d", s, v.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32,
+		reflect.Uint64:
+		fmt.Fprintf(b, ",%s%d", s, v.Uint())
+	case reflect.Float32, reflect.Float64:
+		fmt.Fprintf(b, ",%s%g", s, v.Float())
+	case reflect.String:
+		fmt.Fprintf(b, ",%s%q", s, v.String())
+	}
+}
