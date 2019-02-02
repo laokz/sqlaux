@@ -120,6 +120,13 @@ func prepareVars(rows *sql.Rows, e ...reflect.Value) ([]interface{}, error) {
 // 题，见Scan注释。
 var StructMap map[string]string
 
+// Map2Scanner 表示切片、map等 Go原生类型到其等价的实现了 sql.Scanner接口的自定义
+// 类型的映射，用于从数据库接收查询结果。这样能让程序使用GO原生类型就可以接收结果，而避免
+// 了使用自定义类型时的强制类型转换问题。
+// key 为GO原生类型名称，value为其对应的实现了 Scanner接口的自定义类型值（零值较好），
+// 如： Map2Scanner["[]string"] = mySlice(nil)
+var Map2Scanner = make(map[string]interface{})
+
 // getFieldAddr 返回*struct e中与查询结果列名 n对应的导出字段地址，未找到时返回nil。
 // 查找时遍历e的嵌套 struct，包括非匿名struct或* struct。如果StructMap有值，则先查找
 // 这个映射，否则对“字段名”和“列名”进行大小写不敏感的相等匹配。
@@ -157,6 +164,10 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 		return strings.ToLower(field) == strings.ToLower(col)
 	})
 	if f.IsValid() {
+		if m, ok := Map2Scanner[f.Type().String()]; ok { // 可以转成Scanner接口
+			pt := reflect.PtrTo(reflect.TypeOf(m))
+			return f.Addr().Convert(pt).Interface()
+		}
 		return f.Addr().Interface()
 	}
 	for i := 0; i < v.NumField(); i++ { // 在e的非匿名结构字段继续找
