@@ -26,6 +26,8 @@ import (
 // 果赋予v1而不是v2，为避免这种情况可在表间用空列''分隔，如：SELECT t1.*,'',t2.C1
 // **默认Scan对结构字段名和数据库列名进行大小写不敏感的相等匹配，使用StructMap可以
 // 定制映射关系。
+// ***GO sql包使用 Scanner接口接收自定义类型的数据，可以使用这里提供的Map2IOer数据
+// 结构用GO原生类型接收相应的自定义数据。
 func Scan(rows *sql.Rows, dest ...interface{}) error {
 	// 创建接收结果的临时变量
 	if len(dest) == 0 {
@@ -120,16 +122,20 @@ func prepareVars(rows *sql.Rows, e ...reflect.Value) ([]interface{}, error) {
 // 题，见Scan注释。
 var StructMap map[string]string
 
-// Map2IOer 表示切片、map等 Go原生类型到其等价的实现了 sql.Scanner接口的自定义
-// 类型的映射，用于从数据库接收查询结果。这样能让程序使用GO原生类型就可以接收结果，而避免
-// 了使用自定义类型时的强制类型转换问题。
-// key 为GO原生类型名称，value为其对应的实现了 Scanner接口的自定义类型值（零值较好），
-// 如： Map2IOer["[]string"] = mySlice(nil)
+// Map2IOer 表示切片、map等 Go原生类型到其等价的实现了 sql.Scanner接口或
+// fmt.Stringer接口的自定义类型的映射，用于从数据库接收查询结果、或向数据库写入数据。
+// 这样能让程序使用GO原生类型进行数据库 I/O，避免直接使用自定义类型带来的诸多类型转换问题。
+//
+// key 为GO原生类型名称，value为其对应的实现了上述接口的自定义类型值，值可以为任意值，但
+// 零值较好，其中Scanner接口类型不包括引用指针。这两个接口不需要同时实现。
+// 如： Map2IOer["[]string"] = mySliceT(nil)
+// 用于非原生类型时应前缀包名，如：Map2IOer["time.Time"] = myTimeT(time.Now())
 var Map2IOer = make(map[string]interface{})
 
 // getFieldAddr 返回*struct e中与查询结果列名 n对应的导出字段地址，未找到时返回nil。
-// 查找时遍历e的嵌套 struct，包括非匿名struct或* struct。如果StructMap有值，则先查找
-// 这个映射，否则对“字段名”和“列名”进行大小写不敏感的相等匹配。
+// 查找时遍历e的嵌套 struct，包括非匿名struct或* struct。
+// 如果StructMap有值，则先查找它，否则对“字段名”和“列名”进行大小写不敏感的相等匹配。
+// 如果Map2IOer中有相应的 Scanner映射，则进行类型转换。
 func getFieldAddr(n string, e reflect.Value) interface{} {
 	v := reflect.Indirect(e)
 
@@ -167,7 +173,7 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 		if m, ok := Map2IOer[f.Type().String()]; ok {
 			pt := reflect.PtrTo(reflect.TypeOf(m))
 			if _, ok := pt.MethodByName("Scan"); ok { // 可以转成Scanner接口
-				return f.Addr().Convert(pt).Interface()
+				return f.Addr().Convert(pt).Interface() // 则进行类型转换
 			}
 		}
 		return f.Addr().Interface()
@@ -193,6 +199,8 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 // 和实现了 fmt.Stringer的自定义类型。未实现fmt.Stringer接口的 struct类型成员将递归拼
 // 接，指针类型成员解一级引用再判断。注意：自定义的String()输出要符合数据库的格式要求。
 // ** Buildstr默认将结构字段名转换成小写作为数据库表的列名，使用StructMap可以定制映射关系。
+// *** 通过在Map2IOer中建立 GO原生类型与其 Stringer实现的映射，可以避免在程序中直接使用
+// 自定义类型。
 func Buildstr(flag bool, data interface{}, field ...string) (string, error) {
 	v := reflect.ValueOf(data)
 	if reflect.Indirect(v).Kind() != reflect.Struct {
@@ -207,6 +215,17 @@ func Buildstr(flag bool, data interface{}, field ...string) (string, error) {
 		return "(" + b.String()[1:] + ")", nil // 去掉第一个逗号
 	}
 	return b.String()[1:], nil // SET形式
+}
+
+// hasStringer 检查Map2IOer，如果v的真实类型有映射，则返回其强制类型转换后的值。
+func hasStringer(v reflect.Value) (reflect.Value, bool) {
+	if m, ok := Map2IOer[v.Type().String()]; ok {
+		mt := reflect.TypeOf(m)
+		if _, ok := mt.MethodByName("String"); ok {
+			return v.Convert(mt), true
+		}
+	}
+	return v, false
 }
 
 // walkFields 遍历v 的field字段，根据flag标志，将“值串”写入b。
@@ -228,18 +247,20 @@ func walkFields(b *strings.Builder, flag bool, v reflect.Value,
 			}
 
 			// 拼接简单类型和实现了Stringer接口的类型，以及：
-			if _, ok := vv.Interface().(fmt.Stringer); !ok {
-				// 指针解一级引用再判断。*T未实现的接口 T一定也未实现
-				vvv := reflect.Indirect(vv)
-				if vvv.Kind() >= reflect.Complex64 { // “复杂”类型
-					switch vvv.Kind() {
-					case reflect.String: // 看作简单类型
-						break
-					case reflect.Struct: // 递归遍历
-						walkFields(b, flag, vvv.Addr())
-						continue
-					default:
-						continue // 其它跳过
+			if _, ok := hasStringer(vv); !ok { // Map2IOer
+				if _, ok := vv.Interface().(fmt.Stringer); !ok {
+					// 指针解一级引用再判断。*T未实现的接口 T一定也未实现
+					vvv := reflect.Indirect(vv)
+					if vvv.Kind() >= reflect.Complex64 { // “复杂”类型
+						switch vvv.Kind() {
+						case reflect.String: // 看作简单类型
+							break
+						case reflect.Struct: // 递归遍历
+							walkFields(b, flag, vvv.Addr())
+							continue
+						default:
+							continue // 其它跳过
+						}
 					}
 				}
 			}
@@ -311,13 +332,17 @@ func field2col(stru, field string) string {
 // v可以是实现了 fmt.Stringer接口的类型，及反射Kind为 Bool、Int、Uint、Float、String
 // 的“简单”类型或其指针，其它忽略。
 func buildstr(b *strings.Builder, s string, v reflect.Value) {
-	if f, ok := v.Interface().(fmt.Stringer); ok {
+	if vv, ok := hasStringer(v); ok { // 优先级1：Map2IOer
+		fmt.Fprintf(b, ",%s%s", s, vv.MethodByName("String").Call(nil)[0])
+		return
+	}
+	if f, ok := v.Interface().(fmt.Stringer); ok { // 优先级2：Stringer
 		fmt.Fprintf(b, ",%s%s", s, f.String())
 		return
 	}
 
 	v = reflect.Indirect(v) // 如果是指针，解引用
-	switch v.Kind() {
+	switch v.Kind() {       // 优先级3：简单类型
 	case reflect.Bool:
 		fmt.Fprintf(b, ",%s%t", s, v.Bool())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
