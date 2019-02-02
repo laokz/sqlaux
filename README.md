@@ -56,13 +56,13 @@ T1、T2分别对应着数据库表t1和t2
 在一个应用中，GO数据结构与数据库的对应关系通常是固定的，因此以上的函数运用可以：简化标准包中的繁琐操作、保持SQL语句的直观、提供灵活的应用定制功能。
 
 ### Tricks
-1. Map2Scanner映射
+1. Map2IOer映射
 
 GO sql包使用 Scanner接口从数据库接收结果，这样就需要程序自定义类型来实现这个接口，接收结果简单了，但在程序其它的逻辑中往往需要对这个自定义的类型频繁进行类型转换，麻烦。
 
-sqlaux 提供了一个已初始化的Map2Scanner映射，可让程序两者兼得：
+sqlaux 提供了一个已初始化的Map2IOer映射，可让程序两者兼得：
 
-var Map2Scanner = make(map[string]interface{})
+var Map2IOer = make(map[string]interface{})
 
 key 为GO原生类型名称，value为其对应的实现了 Scanner接口的自定义类型值，可为任意值，但零值比较好。
 
@@ -72,7 +72,7 @@ key 为GO原生类型名称，value为其对应的实现了 Scanner接口的自�
 	type mySlice []string                  // 自定义其对应的Scanner接口实现
 	func (p *mySlice) Scan(...) {...}
 
-	Map2Scanner["[]string"] = mySlice(nil) // 设置对应关系。OK
+	Map2IOer["[]string"] = mySlice(nil) // 设置对应关系。OK
 
 ### Appreciate
-如果觉得有BUG，请告诉我，我将非常感谢你的帮助！如果使用了它，也请告诉我，我将感到非常荣幸:)。
+如果有BUG，请告诉我，我将非常感谢你的帮助！如果使用了它，也请告诉我，我将感到非常荣幸:)。
