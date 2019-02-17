@@ -172,8 +172,8 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 	if f.IsValid() {
 		if m, ok := Map2IOer[f.Type().String()]; ok {
 			pt := reflect.PtrTo(reflect.TypeOf(m))
-			if _, ok := pt.MethodByName("Scan"); ok { // 可以转成Scanner接口
-				return f.Addr().Convert(pt).Interface() // 则进行类型转换
+			if pt.Implements(reflect.TypeOf((*sql.Scanner)(nil)).Elem()) {
+				return f.Addr().Convert(pt).Interface() // Scanner类型转换
 			}
 		}
 		return f.Addr().Interface()
@@ -221,8 +221,8 @@ func Buildstr(flag bool, data interface{}, field ...string) (string, error) {
 func hasStringer(v reflect.Value) (reflect.Value, bool) {
 	if m, ok := Map2IOer[v.Type().String()]; ok {
 		mt := reflect.TypeOf(m)
-		if _, ok := mt.MethodByName("String"); ok {
-			return v.Convert(mt), true
+		if mt.Implements(reflect.TypeOf((*fmt.Stringer)(nil)).Elem()) {
+			return v.Convert(mt), true // Stringer类型转换
 		}
 	}
 	return v, false
