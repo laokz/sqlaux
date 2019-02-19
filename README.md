@@ -5,7 +5,7 @@
 
 GOLANG sql标准包提供的数据库操作简单而直接，但在进行查询操作时，由于必须准备与*sql.Rows结果列完全一致的变量，因此当面对经常使用而又需求多变的SELECT操作时，sql包就显得非常繁琐。INSERT、UPDATE罗列那些字段实在是令人头疼。同时自定义类型的频繁类型转换也是一个麻烦事。
 
-在试验其它如ORM、BUILDER等类型的扩展包时，有的比较复杂，学习跟踪成本比较高，有的非常面向对象而遮蔽了SQL本身直接的逻辑。
+在试验其它如ORM、BUILDER等类型的扩展包时，有的比较复杂，学习跟踪成本比较高，有的非常面向对象而遮蔽了SQL本身直接的逻辑。SQLX也太重了。
 
 因此写了这个辅助函数，期望既能保持数据库操作的简单直接，又减少不必要的编程负担，可以说是用小的时空成本换取编程效率的提升。对于希望保持语句可控，逻辑简捷，代码轻量者是有益的。整个包实际不过300多行。
 
@@ -41,13 +41,13 @@ T1、T2分别对应着数据库表t1和t2
 		...
 	}
 	type MyType {...}
-	func (s MyType) String() string {...} // 实现fmt.Stringer接口
+	func (s MyType) Value() (driver.Value, error) {...} // 实现driver.Valuer接口
 
 将包含该字段的值插入数据库：
 
 	var v = T{..., f:..., ...}
 	vstr, _ := Buildstr(true, &v)
-	db.Exec(`INSERT INTO t VALUES ` + vstr) // f的值会按String()方法转换
+	db.Exec(`INSERT INTO t VALUES ` + vstr) // f的值会按Value()方法转换
 
 
 
@@ -56,34 +56,30 @@ T1、T2分别对应着数据库表t1和t2
 在一个应用中，GO数据结构与数据库的对应关系通常是固定的，因此以上的函数运用可以：简化标准包中的繁琐操作、保持SQL语句的直观、提供灵活的应用定制功能。
 
 ### Tricks
-1. 使用切片、map等GO原生类型接收查询结果
-
-GO sql包使用 Scanner接口从数据库接收结果，这样就需要程序自定义类型来实现这个接口，接收结果简单了，但在程序其它的逻辑中往往需要对这个自定义的类型频繁进行类型转换，麻烦。
+GO sql包使用 Scanner接口从数据库接收结果，这样就需要程序自定义类型来实现这个接口，上面的例子接收结果简单了，但在程序其它的逻辑中往往需要对这个自定义的类型频繁进行类型转换，麻烦。
 
 sqlaux 提供了一个已初始化的Map2IOer映射，可让程序两者兼得：
 
 	var Map2IOer = make(map[string]interface{})
 
-key 为GO原生类型名称，value为其对应的实现了 Scanner接口的自定义类型值，可为任意值，但零值比较好。
+键为GO原生类型名称，值为其对应的实现了 Scanner 和/或 Valuer 接口的自定义类型值，可为任意值。
 
-比如：
+1. 使用切片、map等GO原生类型接收查询结果
 
 	type T {..., Aslice []string, ...}     // Aslice使用 Go原生类型
-	type mySlice []string                  // 自定义其对应的Scanner接口实现
+	type mySlice []string                  // 自定义其对应的Scanner接口实现类型
 	func (p *mySlice) Scan(...) {...}
 
 	Map2IOer["[]string"] = mySlice(nil)    // 设置对应关系。OK
 
 2. 使用切片、map等GO原生类型拼接INSERT值串
 
-基于上述同样的问题和解决办法。
+基于上述同样办法解决。比如：
 
-比如：
+	func (s mySlice) Value() ... {...}     // 再实现driver.Valuer接口
+	                                       // 映射在上例已建立。OK
 
-	func (s mySlice) String() string {...} // 再实现fmt.Stringer接口
-	                                       // 映射在上一块已建立。OK
-
-再比如建立time.Time的映射：
+也可以对Go包提供的类型建立映射，如：
 
 	Map2IOer["time.Time"] = myTime(time.Now())
 

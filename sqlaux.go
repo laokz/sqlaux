@@ -2,6 +2,7 @@ package sqlaux
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"reflect"
 	"strings"
@@ -122,12 +123,13 @@ func prepareVars(rows *sql.Rows, e ...reflect.Value) ([]interface{}, error) {
 // 题，见Scan注释。
 var StructMap map[string]string
 
-// Map2IOer 表示切片、map等 Go原生类型到其等价的实现了 sql.Scanner接口或
-// fmt.Stringer接口的自定义类型的映射，用于从数据库接收查询结果、或向数据库写入数据。
+// Map2IOer 表示切片、map等 Go原生类型到其等价的实现了 sql.Scanner或 driver.Valuer
+// 接口的自定义类型的映射，用于从数据库接收查询结果、或向数据库写入数据。
 // 这样能让程序使用GO原生类型进行数据库 I/O，避免直接使用自定义类型带来的诸多类型转换问题。
+// 注意：Valuer返回的值应同时满足 fmt %v和数据库格式。
 //
-// key 为GO原生类型名称，value为其对应的实现了上述接口的自定义类型值，值可以为任意值，但
-// 零值较好，其中Scanner接口类型不包括引用指针。这两个接口不需要同时实现。
+// key 为GO原生类型名称，value为其对应的实现了上述接口的自定义类型值(不取地址)，
+// 值可以为任意值，但零值较好。这两个接口不需要同时实现。
 // 如： Map2IOer["[]string"] = mySliceT(nil)
 // 用于非原生类型时应前缀包名，如：Map2IOer["time.Time"] = myTimeT(time.Now())
 var Map2IOer = make(map[string]interface{})
@@ -191,46 +193,47 @@ func getFieldAddr(n string, e reflect.Value) interface{} {
 
 // Buildstr 为单表SQL INSERT和 UPDATE拼接符合规范的（赋）值串。
 // data为与数据库表对应的*struct或 struct变量；field为需要拼接的导出字段名，没有时表示
-// 所有导出字段*；flag为真表示拼接结果是 VALUES形式，否则是 SET形式，即：
+// 所有导出字段*；isValues为真表示拼接结果是 VALUES形式，否则是 SET形式，即：
 //		VALUES形式：(值1,值2,...)
 //		SET形式：   列名1=值1,列名2=值2,...    // **
 //
 // * Buildstr支持的字段类型包括反射 Kind < Complex64的“简单”类型、reflect.String
-// 和实现了 fmt.Stringer的自定义类型。未实现fmt.Stringer接口的 struct类型成员将递归拼
-// 接，指针类型成员解一级引用再判断。注意：自定义的String()输出要符合数据库的格式要求。
+// 和实现了 driver.Valuer的自定义类型。未实现Valuer接口的 struct类型成员将递归拼
+// 接，指针类型成员解一级引用再判断。
 // ** Buildstr默认将结构字段名转换成小写作为数据库表的列名，使用StructMap可以定制映射关系。
-// *** 通过在Map2IOer中建立 GO原生类型与其 Stringer实现的映射，可以避免在程序中直接使用
+// *** 通过在Map2IOer中建立 GO原生类型与其 Valuer实现的映射，可以避免在程序中直接使用
 // 自定义类型。
-func Buildstr(flag bool, data interface{}, field ...string) (string, error) {
+func Buildstr(isValues bool, data interface{}, field ...string) (string,
+	error) {
 	v := reflect.ValueOf(data)
 	if reflect.Indirect(v).Kind() != reflect.Struct {
 		return "", fmt.Errorf("Buildstr: data 必须是与数据库表对应的struct类型变量")
 	}
 
 	var b strings.Builder
-	if err := walkFields(&b, flag, v, field...); err != nil { // 遍历字段
+	if err := walkFields(&b, isValues, v, field...); err != nil { // 遍历字段
 		return "", err
 	}
-	if flag { // VALUES形式
+	if isValues { // VALUES形式
 		return "(" + b.String()[1:] + ")", nil // 去掉第一个逗号
 	}
 	return b.String()[1:], nil // SET形式
 }
 
-// hasStringer 检查Map2IOer，如果v的真实类型有映射，则返回其强制类型转换后的值。
-func hasStringer(v reflect.Value) (reflect.Value, bool) {
+// hasValuer 检查Map2IOer，如果v的真实类型有映射，则返回其强制类型转换后的值。
+func hasValuer(v reflect.Value) (reflect.Value, bool) {
 	if m, ok := Map2IOer[v.Type().String()]; ok {
 		mt := reflect.TypeOf(m)
-		if mt.Implements(reflect.TypeOf((*fmt.Stringer)(nil)).Elem()) {
-			return v.Convert(mt), true // Stringer类型转换
+		if _, ok := m.(driver.Valuer); ok {
+			return v.Convert(mt), true // Valuer类型转换
 		}
 	}
 	return v, false
 }
 
 // walkFields 遍历v 的field字段，根据flag标志，将“值串”写入b。
-// field为空时，遍历v的所有简单类型和实现了 fmt.Stringer的自定义类型的导出字段，
-// 未实现fmt.Stringer的 struct类型成员递归遍历，指针类型成员解一级引用再判断。
+// field为空时，遍历v的所有简单类型和实现了 Valuer的自定义类型的导出字段，
+// 未实现Valuer的 struct类型成员递归遍历，指针类型成员解一级引用再判断。
 //
 // 注意：field为空时对于无法拼接的字段，walkFields只忽略不报错；而field明确的字
 // 段无法拼接时，walkField会报错。
@@ -246,9 +249,9 @@ func walkFields(b *strings.Builder, flag bool, v reflect.Value,
 				continue
 			}
 
-			// 拼接简单类型和实现了Stringer接口的类型，以及：
-			if _, ok := hasStringer(vv); !ok { // Map2IOer
-				if _, ok := vv.Interface().(fmt.Stringer); !ok {
+			// 拼接简单类型和实现了Valuer接口的类型，以及：
+			if _, ok := hasValuer(vv); !ok { // Map2IOer
+				if _, ok := vv.Interface().(driver.Valuer); !ok {
 					// 指针解一级引用再判断。*T未实现的接口 T一定也未实现
 					vvv := reflect.Indirect(vv)
 					if vvv.Kind() >= reflect.Complex64 { // “复杂”类型
@@ -277,10 +280,11 @@ next:
 	for _, n := range field { // 部分字段
 		vv := v.FieldByName(n) // 在v及其匿名结构字段中找
 		if vv.IsValid() {
-			_, ok := vv.Interface().(fmt.Stringer)
+			_, has := hasValuer(vv)
+			_, ok := vv.Interface().(driver.Valuer)
 			vvv := reflect.Indirect(vv) // 排除无法拼接的情况
 			if !ok && vvv.Kind() >= reflect.Complex64 &&
-				vvv.Kind() != reflect.String {
+				vvv.Kind() != reflect.String && !has {
 				return fmt.Errorf("Buildstr: %s字段无法拼接", n)
 			}
 			s := ""    // 对应的列名
@@ -329,15 +333,17 @@ func field2col(stru, field string) string {
 
 // buildstr 向b写入一条符合 SQL规范的（赋）值串。s不为空时写入一条“,s=v的值”，s为空时
 // 写入一条“,v的值”。
-// v可以是实现了 fmt.Stringer接口的类型，及反射Kind为 Bool、Int、Uint、Float、String
+// v可以是实现了 driver.Valuer接口的类型，及反射Kind为 Bool、Int、Uint、Float、String
 // 的“简单”类型或其指针，其它忽略。
 func buildstr(b *strings.Builder, s string, v reflect.Value) {
-	if vv, ok := hasStringer(v); ok { // 优先级1：Map2IOer
-		fmt.Fprintf(b, ",%s%s", s, vv.MethodByName("String").Call(nil)[0])
+	if f, ok := v.Interface().(driver.Valuer); ok { // 优先级1：本身实现了Valuer
+		val, _ := f.Value()
+		fmt.Fprintf(b, ",%s%v", s, val)
 		return
 	}
-	if f, ok := v.Interface().(fmt.Stringer); ok { // 优先级2：Stringer
-		fmt.Fprintf(b, ",%s%s", s, f.String())
+	if vv, ok := hasValuer(v); ok { // 优先级2：映射实现了Valuer
+		val := vv.MethodByName("Value").Call(nil)[0]
+		fmt.Fprintf(b, ",%s%v", s, val.Interface())
 		return
 	}
 
