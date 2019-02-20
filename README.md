@@ -66,6 +66,8 @@ sqlaux 提供了一个已初始化的Map2IOer映射，可让程序两者兼得�
 
 1. 使用切片、map等GO原生类型接收查询结果
 
+如：
+
 	type T {..., Aslice []string, ...}     // Aslice使用 Go原生类型
 	type mySlice []string                  // 自定义其对应的Scanner接口实现类型
 	func (p *mySlice) Scan(...) {...}
