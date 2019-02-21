@@ -1,3 +1,6 @@
+// Package sqlaux implements a few rapid and lightweight SQL auxiliaries.
+// It aims to facilitate receiving from or transfer to DB, with which you
+// can build your own InsertDeleteUpdateSelect easily.
 package sqlaux
 
 import (
@@ -8,6 +11,12 @@ import (
 	"strings"
 	"unicode"
 )
+
+// address is the receiving address reference table
+var address map[string]map[string]struct {
+	offset uintptr
+	typ    reflect.Type
+}
 
 // Scan 是对标准库*sql.Rows.Scan()等方法的再包装，以便于更简捷地接收查询结果。
 // Scan 从已执行完查询的rows中，接收当前结果集（即一个单独的SELECT）的所有结果，
