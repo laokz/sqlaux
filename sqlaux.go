@@ -1,6 +1,24 @@
-// Package sqlaux implements a few rapid and lightweight SQL auxiliaries.
-// It aims to facilitate receiving from or transfer to DB, with which you
-// can build your own InsertDeleteUpdateSelect easily.
+// Package sqlaux 实现了几个快速、轻量的SQL辅助函数，目的是更加方便地从数据
+// 库接收查询结果、向数据库插入更新数据，辅助程序员构建自己的InsertDelete
+// UpdateSelect包。sqlaux用少量的空间成本换取最少的反射包调用，以此确保函数
+// 的时间性能。
+//
+// sqlaux假设应用程序的数据结构，与数据库表有着一一对应的关系；但允许一个数
+// 据结构对应多个同构异名的表（表列定义完全相同，表名不同），如历史记录等。
+// 为避免数据库定义大小写歧义，sqlaux还将列名全部转为小写再处理；建立映射关
+// 系时也不包含表名，因为查询结果通常并不包含表名信息，程序员需保证用正确的
+// 数据结构读写正确的数据库表。
+//
+// sqlaux支持两种映射：
+//	1. 小写(列名) != 小写(字段名)时的名称映射。这是必需的映射。
+//		sqlaux 通过struct tag识别字段、列名对应关系，默认将所有导出字段名
+//		（含除time.Time外的嵌套结构成员）小写，作为与其对应的数据库表列名。
+//	2. 字段类型不能直接用于数据库读写时的类型映射。这是可选的映射。
+//		通常这时字段应使用自定义类型，并且实现sql.Scanner和/或driver.Valuer
+//		接口，这不需要作映射。但对于切片等Go原生类型，直接使用自定义类型会带
+//		来很多类型转换问题。这两个接口仅用于数据库读写，因此sqlaux提供类型映
+//		射方法，可以使得程序继续使用Go原生类型，而在sqlaux内部使用与其等价的
+//		自定义类型进行数据库读写。
 package sqlaux
 
 import (
@@ -8,366 +26,381 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"unicode"
+	"unsafe"
 )
 
-// address is the receiving address reference table
-var address map[string]map[string]struct {
+// entryT 表示实际映射项信息。name 用于field-->column的映射，表示列名，当键
+// 为"struct名"时，name为该结构所有映射字段名的切片，当entryT用于，确定具体
+// 接收字段地址时，name借指字段所在结构在接收结构切片中的索引；offset 表示字
+// 段相对最外层struct的全局偏移；typ为字段类型，或其等价的实现了sql.Scanner/
+// driver.Valuer接口的自定义类型。offset、typ在两个映射中是重复的。???
+type entryT struct {
+	name   interface{}
 	offset uintptr
 	typ    reflect.Type
 }
 
-// Scan 是对标准库*sql.Rows.Scan()等方法的再包装，以便于更简捷地接收查询结果。
-// Scan 从已执行完查询的rows中，接收当前结果集（即一个单独的SELECT）的所有结果，
-// 并追加到dest所指向的数据切片中。接收后Scan 不主动关闭rows，这样如果还有别的
-// 结果集，可继续对rows进行操作。
+// mapping 为Go数据结构与数据库表的映射。key 分为三种情况：
+//	● "1.struct名.column名"，表示column-->field的映射，用于Scan()
+//	● "0.struct名.field名"，表示field-->column的映射，用于Buildstr()
+//	● "struct名"，表示该结构的映射已建立
+var mapping = make(map[string]entryT)
+
+// isinit 检查映射初始化函数是否在init()中调用，以防止出现竞争条件。
+func isinit() bool {
+	var pc [10]uintptr
+	n := runtime.Callers(2, pc[:])
+	fs := runtime.CallersFrames(pc[:n])
+	var f runtime.Frame
+	b := true
+	for b {
+		f, b = fs.Next()
+		if strings.Contains(f.Function, ".init.") { // xxx.init.N
+			return true
+		}
+	}
+	return false
+}
+
+// 以下三个导出变量为struct tag，用于sqlaux识别结构字段所对应的数据库列名。
+// Tag标签名；Key列名键；Op键值分隔符。如：`db:"col=xxx yyy=zzz"`
+var (
+	Tag = "db"
+	Key = "col"
+	Op  = "="
+)
+
+// MapStruct 为Go数据结构与数据库表建立名称映射。调用者需在init()中，对每一
+// 个关联数据库的结构调用此函数进行显式映射。
+// stru为需要映射的数据结构，以变量值的形式作参数，可以取零值。
+func MapStruct(stru ...interface{}) error {
+	// check caller is init(), ensure no race condition
+	if !isinit() {
+		return fmt.Errorf("MapStruct: must be called in init()")
+	}
+
+	for _, d := range stru {
+		v := reflect.Indirect(reflect.ValueOf(d))
+		s := v.Type().Name()
+		if s == "" || v.Kind() != reflect.Struct {
+			return fmt.Errorf("MapStruct: invalid struct %q", v.Type())
+		}
+		if _, ok := mapping[s]; ok {
+			return fmt.Errorf("MapStruct: %q already mapped", v.Type())
+		}
+		fs, err := initmap(s, v, 0)
+		if err != nil {
+			return fmt.Errorf("MapStruct: %v", err)
+		}
+		mapping[s] = entryT{name: fs} // mark this struct as initiated
+	}
+
+	return nil
+}
+
+// initmap 递归遍历结构v，为所有导出字段创建映射项。s为完整结构名（可能为嵌
+// 套结构），b为结构相对于最外层结构的全局偏移量，返回的切片为字段名。
+func initmap(s string, v reflect.Value, b uintptr) ([]string, error) {
+	dot := strings.Index(s, ".") // for diff the most outer struct name
+	t := v.Type()
+	fs := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		tt := t.Field(i)
+		if !unicode.IsUpper([]rune(tt.Name)[0]) { // ignore non-exported
+			continue
+		}
+		col := strings.ToLower(tt.Name) // record its default column name
+		nt := tt.Type                   // record its type
+		if ntt, ok := typemap[nt]; ok { // use mapped type if possible
+			nt = ntt
+		}
+		got := false // record if found tagged column name
+		tags := tt.Tag.Get(Tag)
+		if tags != "" {
+			vs := strings.Fields(tags)
+			for _, v := range vs {
+				fc := strings.Split(v, Op)
+				if fc[0] == Key {
+					col = fc[1]
+					got = true
+					break
+				}
+			}
+		}
+		if !got && tt.Type.Kind() == reflect.Struct && // recursive struct
+			tt.Type.String() != "time.Time" { // except "time.Time"
+			ffs, err := initmap(s+"."+tt.Name, v.Field(i), b+tt.Offset)
+			if err != nil {
+				return nil, err
+			}
+			fs = append(fs, ffs...)
+		} else {
+			if col == "" || strings.ToLower(col) != col {
+				return nil, fmt.Errorf("%s.%s bad tagged 'col'", s, tt.Name)
+			}
+			mapping["0."+s+"."+tt.Name] = entryT{col, b + tt.Offset, nt}
+			sss := "1." // "1.the-most-outer-struct.column"
+			if dot == -1 {
+				sss += s + "." + col
+				fs = append(fs, tt.Name) // without the most outer struct
+			} else {
+				sss += s[:dot+1] + col
+				fs = append(fs, s[dot+1:]+"."+tt.Name)
+			}
+			if _, ok := mapping[sss]; ok { // column maybe wrong duplicate
+				return nil, fmt.Errorf("%q duplicate column map %q", s, col)
+			}
+			mapping[sss] = entryT{nil, b + tt.Offset, nt}
+		}
+	}
+	return fs, nil
+}
+
+// typemap 为字段类型到其等价的实现了sql.Scanner/driver.Valuer接口的自定义类
+// 型的映射。这实际上是一个临时变量，初始化过程结束后，该变量就不再使用。???
+var typemap = make(map[reflect.Type]reflect.Type)
+
+// MapType 为Go数据结构与数据库表建立类型映射。调用者需在init()中，针对每一
+// 个在程序中使用Go原生类型，而在数据库读写时使用自定义类型的情况，调用此函
+// 数进行显式映射。orig、self分别为原生类型和自定义类型值，可以用零值。
+// sql.Scanner接收器为指针型，driver.Valuer接收器为值型，sqlaux约定这里的参
+// 数统一用T而不用*T。参见包文档和README。
+func MapType(orig, self interface{}) error {
+	// check caller is init(), ensure no race condition
+	if !isinit() {
+		return fmt.Errorf("MapType: must be called in init()")
+	}
+
+	// check if already initiated
+	ov := reflect.TypeOf(orig)
+	sv := reflect.TypeOf(self)
+	if _, ok := typemap[ov]; ok {
+		return fmt.Errorf("MapType: type %q already mapped", ov)
+	}
+
+	// check if the 2 types deep equal
+	if !ov.ConvertibleTo(sv) {
+		return fmt.Errorf("MapType: %q not convertible to %q", ov, sv)
+	}
+
+	// map and update mapping
+	typemap[ov] = sv
+	for k, v := range mapping {
+		if v.typ == ov {
+			v.typ = sv
+			mapping[k] = v
+		}
+	}
+	return nil
+}
+
+// Scan 从已执行完查询的rows中，接收当前结果集（即一个单独的SELECT）的所有结
+// 果，覆盖写入dest。接收后Scan 不主动关闭rows。
 //
-// 约定与示例:
-//	type T struct {...}
-//	type T1 struct {...}				 // 对应数据库表t1
-//	type T2 struct {..., T, ...}		 // 可以嵌套struct
-//	var v1 []*T1; var v2 []*T2
-//	rs, _ := db.Query(`SELECT t1.*,		 // 逐表罗列选择列*
-//	         t2.C1,t2.C2 FROM t1,t2...`)
-//	Scan(rs, &v1, &v2)	 				 // dest的类型形如*[]*struct
-//										 // 接收参数一一对应SELECT后的表**
-// *选择列时，如果两表“交界”处的列名如C1，在T1、T2中有相同的映射名，则Scan 可能将结
-// 果赋予v1而不是v2，为避免这种情况可在表间用空列''分隔，如：SELECT t1.*,'',t2.C1
-// **默认Scan对结构字段名和数据库列名进行大小写不敏感的相等匹配，使用StructMap可以
-// 定制映射关系。
-// ***GO sql包使用 Scanner接口接收自定义类型的数据，可以使用这里提供的Map2IOer数据
-// 结构用GO原生类型接收相应的自定义数据。
+// 约定：
+//	● 每一个dest的类型形如*[]*struct。
+//	● SELECT选择列时逐表罗列，表间可选地用''空列分隔。当两表“交界”处有重名列
+//		时，默认sqlaux将其视为前一个表的列，用空列区隔可避免重名歧义。
 func Scan(rows *sql.Rows, dest ...interface{}) error {
-	// 创建接收结果的临时变量
-	if len(dest) == 0 {
-		return fmt.Errorf("Scan: dest接收参数不能为空")
-	}
-	tmp := make([]reflect.Value, len(dest)) // 用于每次rows.Scan的变量
-	rsa := make([]reflect.Value, len(dest)) // 用于累积结果的变量
-	for i, r := range dest {
-		t := reflect.TypeOf(r) // *[]*struct
-		if t.Kind() != reflect.Ptr || t.Elem().Kind() != reflect.Slice ||
-			t.Elem().Elem().Kind() != reflect.Ptr ||
-			t.Elem().Elem().Elem().Kind() != reflect.Struct {
-			return fmt.Errorf("Scan: dest[%d]参数非结构指针切片地址", i)
-		}
-		tmp[i] = reflect.New(t.Elem().Elem().Elem())  // *struct
-		rsa[i] = reflect.Indirect(reflect.ValueOf(r)) // []*struct
+	l := len(dest)
+	if l == 0 {
+		return fmt.Errorf("Scan: no dest argument")
 	}
 
-	// 根据查询结果确定具体的接收字段地址。使用固定的变量可省去每次Scan都要确定地址的步骤
-	ptr, err := prepareVars(rows, tmp...)
+	// prepare receiver variable
+	typ := make([]reflect.Type, l)  // type of every dest
+	rsa := make([]reflect.Value, l) // []*struct, for accumulating results
+	for i, d := range dest {
+		t := reflect.TypeOf(d)          // *[]*struct
+		typ[i] = t.Elem().Elem().Elem() // struct
+		if !strings.HasPrefix(t.String(), "*[]*") ||
+			typ[i].Kind() != reflect.Struct {
+			return fmt.Errorf("Scan: dest[%d] not like *[]*struct", i)
+		}
+		rsa[i] = reflect.MakeSlice(t.Elem(), 0, 0) // []*struct
+	}
+	ref, err := scanField(rows, typ) // calculate dest fields reference
 	if err != nil {
-		return err
+		return fmt.Errorf("Scan: %v", err)
 	}
+	var null = new(string) // for NULL column '', cannot be nil
 
-	// 接收所有结果
+	// receive all results
+	tmp := make([]reflect.Value, l)      // new struct variable for a scan
+	ptr := make([]interface{}, len(ref)) // their appropriate fields pointer
 	for rows.Next() {
-		if err = rows.Scan(ptr...); err != nil {
-			return err
+		for i := 0; i < l; i++ { // create new struct variable
+			tmp[i] = reflect.New(typ[i])
+			rsa[i] = reflect.Append(rsa[i], tmp[i])
 		}
-		for i, v := range tmp { // 将接收到的值拷贝并追加到累积结果变量中
-			t := v.Elem().Type() // struct
-			vv := reflect.New(t)
-			vv.Elem().Set(v.Elem())
-			rsa[i] = reflect.Append(rsa[i], vv)
-			v.Elem().Set(reflect.Zero(t)) // 清零固定的接收变量
+		for i := 0; i < len(ref); i++ {
+			if ref[i].name == nil { // NULL column
+				ptr[i] = null
+			} else {
+				p := unsafe.Pointer(tmp[ref[i].name.(int)].Pointer() +
+					ref[i].offset)
+				ptr[i] = reflect.NewAt(ref[i].typ, p).Interface()
+			}
+		}
+		if err = rows.Scan(ptr...); err != nil {
+			return fmt.Errorf("Scan: %v", err)
 		}
 	}
 	if err = rows.Err(); err != nil {
-		return err
+		return fmt.Errorf("Scan: %v", err)
 	}
 
-	// 将累积的结果赋予接收参数
-	for i := 0; i < len(dest); i++ {
+	// write to dest
+	for i := 0; i < l; i++ {
 		reflect.ValueOf(dest[i]).Elem().Set(rsa[i])
 	}
 	return nil
 }
 
-// prepareVars 根据rows.Columns()的列名，返回*struct e中适合 Scan的字段地址切片。
-// 约定：列名逐表排列，表间可用空列''分隔。
-func prepareVars(rows *sql.Rows, e ...reflect.Value) ([]interface{}, error) {
-	cols, _ := rows.Columns()                 // 结果列
-	var r = make([]interface{}, 0, len(cols)) // 接收字段地址切片
-	var null = new(string)                    // 占位空字段
-
-	var i, j int // i遍历结果列，j遍历接收结构
-	for ; i < len(cols) && j < len(e); i++ {
-		if cols[i] == "" { // 遇到表间隔标识后，下次将在下个struct中查找合适的字段指针
-			r = append(r, null)
+// scanField 根据rows.Columns()和映射，返回ts中适合 Scan的字段参考信息。
+// 如果在当前struct中未找到某列名的映射，则必须在其紧接着的struct中找到，
+// 否则违背Scan约定。
+func scanField(rows *sql.Rows, ts []reflect.Type) ([]entryT, error) {
+	col, _ := rows.Columns()
+	ref := make([]entryT, len(col))
+	var i, j int // i for col, j for ts
+	var v entryT
+	var ok bool
+	stru := ts[0].Name()
+	for ; i < len(col) && j < len(ts); i++ {
+		if col[i] == "" { // delemiter of tables, move to next struct
 			j++
+			if j == len(ts) {
+				break
+			}
+			stru = ts[j].Name()
 			continue
 		}
-		f := getFieldAddr(cols[i], e[j]) // 在当前struct查找
-		if f == nil {                    // 未找到，在下个struct找
-			if j == len(e)-1 {
-				return nil, fmt.Errorf("列%s无匹配字段，请检查整个数据映射", cols[i])
-			}
-			if f = getFieldAddr(cols[i], e[j+1]); f == nil {
-				return nil, fmt.Errorf("列%s无匹配字段，请检查整个数据映射", cols[i])
-			}
+		dot := strings.LastIndex(col[i], ".")
+		if dot != -1 { // eliminate table name & trans to lowercase
+			col[i] = strings.ToLower(col[i][dot+1:])
+		} else {
+			col[i] = strings.ToLower(col[i])
+		}
+		// mapping must exist in the current or the successive struct
+		if v, ok = mapping["1."+stru+"."+col[i]]; !ok {
 			j++
+			if j == len(ts) {
+				return nil, fmt.Errorf("column %q has no mapping", col[i])
+			}
+			stru = ts[j].Name()
+			if v, ok = mapping["1."+stru+"."+col[i]]; !ok {
+				return nil, fmt.Errorf("column %q has no mapping", col[i])
+			}
 		}
-		r = append(r, f)
+		ref[i].name = j
+		ref[i].offset = v.offset
+		ref[i].typ = v.typ
 	}
-	if i < len(cols) {
-		return nil, fmt.Errorf("列%s无匹配字段，请检查整个数据映射", cols[i:])
+	if i < len(col) {
+		return nil, fmt.Errorf("column %v has no mapping", col[i:])
 	}
-	return r, nil
+	return ref, nil
 }
 
-// StructMap 提供GO struct到数据库表的名称映射，默认为nil。键值串的格式为“xxx.xxx”，
-// 对于key表示的是“结构名.字段名”，对于value表示的是“数据库表名.列名”，其中结构名和数
-// 据库表名均可以为空，表示不做限制，字段必须为导出字段，点.不能省略。系统忽略不合法的映
-// 射而不报错。匹配规则：
-//	1. 查找指定的“结构名.字段名”的映射
-//	2. 查找不限制结构名的“.字段名”的映射
-//	3. 对于有映射的，如为期望的“表名.列名”或“.列名”，则成功，否则失败
-//  4. 对于没有映射的，对“字段名”和“列名”进行大小写不敏感的相等匹配
+// Buildstr 为单表SQL INSERT、UPDATE语句，将data的 field字段拼接成符合规范的
+//（赋）值串："(列名1,列名2,...) VALUES (值1,值2,...),..."
+// field缺省时拼接所有映射字段。
 //
-// 注意：如无特别配置，*sql.Rows.Columns()不包含表名，因此通常不应限制映射的表名。
-// StructMap 能解决GO数据结构与数据库表列名称不一致的问题，但不能解决SELECT选择列歧义问
-// 题，见Scan注释。
-var StructMap map[string]string
-
-// Map2IOer 表示切片、map等 Go原生类型到其等价的实现了 sql.Scanner或 driver.Valuer
-// 接口的自定义类型的映射，用于从数据库接收查询结果、或向数据库写入数据。
-// 这样能让程序使用GO原生类型进行数据库 I/O，避免直接使用自定义类型带来的诸多类型转换问题。
-// 注意：Valuer返回的值应同时满足 fmt %v和数据库格式。
+// 约定：
+//	● data的类型形如[]*struct。
+//	● field为嵌套结构成员时要写全名，即前缀除最外层的所属结构名。
 //
-// key 为GO原生类型名称，value为其对应的实现了上述接口的自定义类型值(不取地址)，
-// 值可以为任意值，但零值较好。这两个接口不需要同时实现。
-// 如： Map2IOer["[]string"] = mySliceT(nil)
-// 用于非原生类型时应前缀包名，如：Map2IOer["time.Time"] = myTimeT(time.Now())
-var Map2IOer = make(map[string]interface{})
+// 注意：Buildstr不限制结果字符串的长度，调用者需防止SQL语句超长。
+func Buildstr(data interface{}, field ...string) (string, error) {
+	// check general errors, prepare variable
+	v := reflect.ValueOf(data) // record data
+	t := v.Type()
+	if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Ptr ||
+		t.Elem().Elem().Kind() != reflect.Struct {
+		return "", fmt.Errorf("Buildstr: data not like []*struct")
+	}
+	if v.Len() == 0 {
+		return "", fmt.Errorf("Buildstr: data is nil")
+	}
+	stru := t.Elem().Elem().Name() // record struct name
+	if e, ok := mapping[stru]; ok {
+		if len(field) == 0 { // record default fields
+			field = e.name.([]string)
+		}
+	} else {
+		return "", fmt.Errorf("Buildstr: %q has no mapping", stru)
+	}
 
-// getFieldAddr 返回*struct e中与查询结果列名 n对应的导出字段地址，未找到时返回nil。
-// 查找时遍历e的嵌套 struct，包括非匿名struct或* struct。
-// 如果StructMap有值，则先查找它，否则对“字段名”和“列名”进行大小写不敏感的相等匹配。
-// 如果Map2IOer中有相应的 Scanner映射，则进行类型转换。
-func getFieldAddr(n string, e reflect.Value) interface{} {
-	v := reflect.Indirect(e)
+	// build: "(col1,col2,...) VALUES ("
+	var sql strings.Builder
+	sql.WriteString("(")
+	for i, n := range field {
+		if i > 0 {
+			sql.WriteString(",")
+		}
+		if m, ok := mapping["0."+stru+"."+n]; ok {
+			sql.WriteString(m.name.(string))
+		} else {
+			return "", fmt.Errorf("Buildstr: %q has no field %q", stru, n)
+		}
+	}
+	sql.WriteString(") VALUES (")
 
-	i := strings.Index(n, ".") // rows列名可能包含表名
-	table := ""
-	if i != -1 {
-		table = n[:i]
-	}
-	col := n[i+1:]
-	stru := v.Type().Name()
-	f := v.FieldByNameFunc(func(field string) bool { // 在e及其匿名结构字段中找
-		if !unicode.IsUpper([]rune(field)[0]) { // 跳过非导出字段。field总不为空
-			return false
+	// build others
+	for i := 0; i < v.Len(); i++ {
+		if v.Index(i).IsNil() {
+			return "", fmt.Errorf("Buildstr: data[%d] is nil", i)
 		}
-		if StructMap == nil { // 无映射
-			return strings.ToLower(field) == strings.ToLower(col)
+		b := v.Index(i).Pointer() // base address
+		if i > 0 {
+			sql.WriteString("),(")
 		}
-		if tc, ok := StructMap[stru+"."+field]; ok { // 有指定的映射
-			tcs := strings.Split(tc, ".")
-			if len(tcs) == 2 && tcs[1] == col && (tcs[0] == "" ||
-				tcs[0] == table) { // 合法且列名匹配、表名相同或不限制
-				return true
+		for j, n := range field {
+			if j > 0 {
+				sql.WriteString(",")
 			}
-		}
-		if tc, ok := StructMap["."+field]; stru != "" && ok { // 有不限制映射
-			tcs := strings.Split(tc, ".")
-			if len(tcs) == 2 && tcs[1] == col && (tcs[0] == "" ||
-				tcs[0] == table) {
-				return true
-			}
-		}
-		return strings.ToLower(field) == strings.ToLower(col)
-	})
-	if f.IsValid() {
-		if m, ok := Map2IOer[f.Type().String()]; ok {
-			pt := reflect.PtrTo(reflect.TypeOf(m))
-			if pt.Implements(reflect.TypeOf((*sql.Scanner)(nil)).Elem()) {
-				return f.Addr().Convert(pt).Interface() // Scanner类型转换
-			}
-		}
-		return f.Addr().Interface()
-	}
-	for i := 0; i < v.NumField(); i++ { // 在e的非匿名结构字段继续找
-		vv := reflect.Indirect(v.Field(i))
-		if vv.Kind() == reflect.Struct && !v.Type().Field(i).Anonymous {
-			if r := getFieldAddr(n, vv); r != nil {
-				return r
+			m := mapping["0."+stru+"."+n]
+			ptr := reflect.NewAt(m.typ, unsafe.Pointer(b+m.offset))
+			err := buildstr(&sql, "", ptr)
+			if err != nil {
+				return "", fmt.Errorf("Buildstr: %v", err)
 			}
 		}
 	}
-	return nil
+
+	return sql.String() + ")", nil
 }
 
-// Buildstr 为单表SQL INSERT和 UPDATE拼接符合规范的（赋）值串。
-// data为与数据库表对应的*struct或 struct变量；field为需要拼接的导出字段名，没有时表示
-// 所有导出字段*；isValues为真表示拼接结果是 VALUES形式，否则是 SET形式，即：
-//		VALUES形式：(值1,值2,...)
-//		SET形式：   列名1=值1,列名2=值2,...    // **
-//
-// * Buildstr支持的字段类型包括反射 Kind < Complex64的“简单”类型、reflect.String
-// 和实现了 driver.Valuer的自定义类型。未实现Valuer接口的 struct类型成员将递归拼
-// 接，指针类型成员解一级引用再判断。
-// ** Buildstr默认将结构字段名转换成小写作为数据库表的列名，使用StructMap可以定制映射关系。
-// *** 通过在Map2IOer中建立 GO原生类型与其 Valuer实现的映射，可以避免在程序中直接使用
-// 自定义类型。
-func Buildstr(isValues bool, data interface{}, field ...string) (string,
-	error) {
-	v := reflect.ValueOf(data)
-	if reflect.Indirect(v).Kind() != reflect.Struct {
-		return "", fmt.Errorf("Buildstr: data 必须是与数据库表对应的struct类型变量")
-	}
-
-	var b strings.Builder
-	if err := walkFields(&b, isValues, v, field...); err != nil { // 遍历字段
-		return "", err
-	}
-	if isValues { // VALUES形式
-		return "(" + b.String()[1:] + ")", nil // 去掉第一个逗号
-	}
-	return b.String()[1:], nil // SET形式
-}
-
-// hasValuer 检查Map2IOer，如果v的真实类型有映射，则返回其强制类型转换后的值。
-func hasValuer(v reflect.Value) (reflect.Value, bool) {
-	if m, ok := Map2IOer[v.Type().String()]; ok {
-		mt := reflect.TypeOf(m)
-		if _, ok := m.(driver.Valuer); ok {
-			return v.Convert(mt), true // Valuer类型转换
-		}
-	}
-	return v, false
-}
-
-// walkFields 遍历v 的field字段，根据flag标志，将“值串”写入b。
-// field为空时，遍历v的所有简单类型和实现了 Valuer的自定义类型的导出字段，
-// 未实现Valuer的 struct类型成员递归遍历，指针类型成员解一级引用再判断。
-//
-// 注意：field为空时对于无法拼接的字段，walkFields只忽略不报错；而field明确的字
-// 段无法拼接时，walkField会报错。
-func walkFields(b *strings.Builder, flag bool, v reflect.Value,
-	field ...string) error {
-	v = reflect.Indirect(v) // 确保是struct，而不是*struct
-	stru := v.Type().Name() // 结构名
-	if len(field) == 0 {    // 遍历所有字段
-		for i := 0; i < v.NumField(); i++ {
-			f := v.Type().Field(i)                   // 第i个成员的属性
-			vv := v.Field(i)                         // 第i个成员的值
-			if !unicode.IsUpper([]rune(f.Name)[0]) { // 跳过非导出字段
-				continue
-			}
-
-			// 拼接简单类型和实现了Valuer接口的类型，以及：
-			if _, ok := hasValuer(vv); !ok { // Map2IOer
-				if _, ok := vv.Interface().(driver.Valuer); !ok {
-					// 指针解一级引用再判断。*T未实现的接口 T一定也未实现
-					vvv := reflect.Indirect(vv)
-					if vvv.Kind() >= reflect.Complex64 { // “复杂”类型
-						switch vvv.Kind() {
-						case reflect.String: // 看作简单类型
-							break
-						case reflect.Struct: // 递归遍历
-							walkFields(b, flag, vvv.Addr())
-							continue
-						default:
-							continue // 其它跳过
-						}
-					}
-				}
-			}
-			n := f.Name // 字段名
-			s := ""     // 对应的列名
-			if !flag {  // SET形式
-				s = field2col(stru, n) + "="
-			}
-			buildstr(b, s, vv)
-		}
+// buildstr 向b写入一条符合 SQL规范的（赋）值串。s为“列名=”或“”。
+// v 可以是实现了driver.Valuer接口的类型值，及反射Kind为 Bool、Int、Uint、
+// Float、String的“简单”类型或其指针，其它报错。
+func buildstr(b *strings.Builder, s string, v reflect.Value) error {
+	if f, ok := v.Interface().(driver.Valuer); ok {
+		val, _ := f.Value()
+		fmt.Fprintf(b, "%s%#v", s, val)
 		return nil
 	}
-next:
-	for _, n := range field { // 部分字段
-		vv := v.FieldByName(n) // 在v及其匿名结构字段中找
-		if vv.IsValid() {
-			_, has := hasValuer(vv)
-			_, ok := vv.Interface().(driver.Valuer)
-			vvv := reflect.Indirect(vv) // 排除无法拼接的情况
-			if !ok && vvv.Kind() >= reflect.Complex64 &&
-				vvv.Kind() != reflect.String && !has {
-				return fmt.Errorf("Buildstr: %s字段无法拼接", n)
-			}
-			s := ""    // 对应的列名
-			if !flag { // SET形式
-				s = field2col(stru, n) + "="
-			}
-			buildstr(b, s, vv)
-			continue
-		}
-		for i := 0; i < v.NumField(); i++ { // 在非匿名结构字段继续找
-			f := v.Type().Field(i)
-			if !unicode.IsUpper([]rune(f.Name)[0]) {
-				continue // 跳过非导出字段
-			}
-			vv := reflect.Indirect(v.Field(i))
-			if vv.Kind() == reflect.Struct && !f.Anonymous {
-				if err := walkFields(b, flag, vv.Addr(), n); err == nil {
-					continue next // 找到
-				}
-			}
-		}
-		return fmt.Errorf("Buildstr: %s字段未找到", n)
-	}
-	return nil
-}
 
-// field2col 返回结构stru的 field字段对应的数据库列名。
-// 默认将字段名转换成小写作为数据库表的列名，使用StructMap可以定制映射关系。
-func field2col(stru, field string) string {
-	s := strings.ToLower(field)
-	if StructMap != nil {
-		if tc, ok := StructMap[stru+"."+field]; ok { // 有指定的映射
-			tcs := strings.Split(tc, ".")
-			if len(tcs) == 2 {
-				s = tcs[1]
-			}
-		} else if tc, ok := StructMap["."+field]; ok { // 有不限制映射
-			tcs := strings.Split(tc, ".")
-			if len(tcs) == 2 {
-				s = tcs[1]
-			}
-		}
-	}
-	return s
-}
-
-// buildstr 向b写入一条符合 SQL规范的（赋）值串。s不为空时写入一条“,s=v的值”，s为空时
-// 写入一条“,v的值”。
-// v可以是实现了 driver.Valuer接口的类型，及反射Kind为 Bool、Int、Uint、Float、String
-// 的“简单”类型或其指针，其它忽略。
-func buildstr(b *strings.Builder, s string, v reflect.Value) {
-	if f, ok := v.Interface().(driver.Valuer); ok { // 优先级1：本身实现了Valuer
-		val, _ := f.Value()
-		fmt.Fprintf(b, ",%s%v", s, val)
-		return
-	}
-	if vv, ok := hasValuer(v); ok { // 优先级2：映射实现了Valuer
-		val := vv.MethodByName("Value").Call(nil)[0]
-		fmt.Fprintf(b, ",%s%v", s, val.Interface())
-		return
-	}
-
-	v = reflect.Indirect(v) // 如果是指针，解引用
-	switch v.Kind() {       // 优先级3：简单类型
+	v = reflect.Indirect(v)
+	switch v.Kind() {
 	case reflect.Bool:
-		fmt.Fprintf(b, ",%s%t", s, v.Bool())
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		fmt.Fprintf(b, ",%s%d", s, v.Int())
+		fmt.Fprintf(b, "%s%t", s, v.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32,
+		reflect.Int64:
+		fmt.Fprintf(b, "%s%d", s, v.Int())
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32,
 		reflect.Uint64:
-		fmt.Fprintf(b, ",%s%d", s, v.Uint())
+		fmt.Fprintf(b, "%s%d", s, v.Uint())
 	case reflect.Float32, reflect.Float64:
-		fmt.Fprintf(b, ",%s%g", s, v.Float())
+		fmt.Fprintf(b, "%s%g", s, v.Float())
 	case reflect.String:
-		fmt.Fprintf(b, ",%s%q", s, v.String())
+		fmt.Fprintf(b, "%s%q", s, v.String())
+	default:
+		return fmt.Errorf("type %q cannot be valued", v.Type())
 	}
+	return nil
 }
