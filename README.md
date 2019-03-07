@@ -1,4 +1,5 @@
 # sqlaux
+[![Build Status](https://travis-ci.com/LaoK996/sqlaux.svg?branch=master)](https://travis-ci.com/LaoK996/sqlaux)
 ### Description
 这段小程序仅仅提供了GOLANG数据库相关的几个函数和数据结构，目的是更加方便地接收各种查询结果、插入更新各类数据，辅助程序员构建自己的InsertDeleteUpdateSelect库。
 
