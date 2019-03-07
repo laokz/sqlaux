@@ -1,1 +1,6 @@
+require 'coveralls'
+Coveralls.wear!
+
+
 language: GO
+gem 'coveralls', require: false
