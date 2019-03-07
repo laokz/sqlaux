@@ -74,12 +74,14 @@ Convention:
 
 func Buildstr(data interface{}, field ...string) (string, error)
 
-Buildstr for single-table SQL INSERT, UPDATE statement, concatenate the
-data's field into right SQL string, the result takes the form:
- "(col1, col2,...) VALUES (val1, val2... ),... "
-By default, all mapped fields will be dumped.
+Buildstr for single-table SQL INSERT, UPDATE, concatenate "data's field"
+into right SQL string. By default, all mapped fields will be dumped. The
+result takes one of the forms:
+"(col1, col2,...) VALUES (val1, val2... ),..."
+"SET col1=val1,col2=val2,..."
+
 Convention:
-	● The data type is like []*struct.
+	● The data type is like []*struct or *struct.
 	● When a field is a member of nested struct, write its full name, that
 	is, prefix its parent struct names except the outermost.
 Note: Buildstr does not limit the length of the result string, and callers

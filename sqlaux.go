@@ -307,28 +307,36 @@ func scanField(rows *sql.Rows, ts []reflect.Type) ([]entryT, error) {
 }
 
 // Buildstr 为单表SQL INSERT、UPDATE语句，将data的 field字段拼接成符合规范的
-//（赋）值串："(列名1,列名2,...) VALUES (值1,值2,...),..."
-// field缺省时拼接所有映射字段。
+//（赋）值串。field缺省时拼接所有映射字段。返回值：
+// data为切片时："(列名1,列名2,...) VALUES (值1,值2,...),..."，用于INSERT。
+// data为单值时："SET 列名1=值1,列名2=值2,..."，用于INSERT、UPDATE。
 //
 // 约定：
-//	● data的类型形如[]*struct。
+//	● data的类型形如[]*struct或*struct。
 //	● field为嵌套结构成员时要写全名，即前缀除最外层的所属结构名。
 //
 // 注意：Buildstr不限制结果字符串的长度，调用者需防止SQL语句超长。
 func Buildstr(data interface{}, field ...string) (string, error) {
-	// check general errors, prepare variable
-	v := reflect.ValueOf(data) // record data
+	v := reflect.ValueOf(data)
 	t := v.Type()
-	if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Ptr ||
-		t.Elem().Elem().Kind() != reflect.Struct {
-		return "", fmt.Errorf("Buildstr: data not like []*struct")
+	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Ptr &&
+		t.Elem().Elem().Kind() == reflect.Struct {
+		if v.Len() == 0 {
+			return "", fmt.Errorf("Buildstr: data is nil")
+		}
+		return valuebuild(v, field...)
 	}
-	if v.Len() == 0 {
-		return "", fmt.Errorf("Buildstr: data is nil")
+	if t.Kind() == reflect.Ptr && t.Elem().Kind() == reflect.Struct {
+		return setbuild(v, field...)
 	}
-	stru := t.Elem().Elem().Name() // record struct name
+	return "", fmt.Errorf("Buildstr: argument 'data' bad type %q", t)
+}
+
+// valuebuild equivalent to Buildstr, but just for []*struct.
+func valuebuild(v reflect.Value, field ...string) (string, error) {
+	stru := v.Type().Elem().Elem().Name() // record struct name
 	if e, ok := mapping[stru]; ok {
-		if len(field) == 0 { // record default fields
+		if len(field) == 0 { // default all mapped fields
 			field = e.name.([]string)
 		}
 	} else {
@@ -365,14 +373,44 @@ func Buildstr(data interface{}, field ...string) (string, error) {
 			}
 			m := mapping["0."+stru+"."+n]
 			ptr := reflect.NewAt(m.typ, unsafe.Pointer(b+m.offset))
-			err := buildstr(&sql, "", ptr)
-			if err != nil {
+			if err := buildstr(&sql, "", ptr); err != nil {
 				return "", fmt.Errorf("Buildstr: %v", err)
 			}
 		}
 	}
 
 	return sql.String() + ")", nil
+}
+
+// setbuild equivalent to Buildstr, but just for *struct.
+func setbuild(v reflect.Value, field ...string) (string, error) {
+	stru := v.Type().Elem().Name() // record struct name
+	if e, ok := mapping[stru]; ok {
+		if len(field) == 0 { // default all mapped fields
+			field = e.name.([]string)
+		}
+	} else {
+		return "", fmt.Errorf("Buildstr: %q has no mapping", stru)
+	}
+
+	var sql strings.Builder
+	sql.WriteString("SET ")
+	b := v.Pointer() // base address
+	for j, n := range field {
+		if j > 0 {
+			sql.WriteString(",")
+		}
+		m, ok := mapping["0."+stru+"."+n]
+		if !ok {
+			return "", fmt.Errorf("Buildstr: %q has no field %q", stru, n)
+		}
+		ptr := reflect.NewAt(m.typ, unsafe.Pointer(b+m.offset))
+		if err := buildstr(&sql, m.name.(string)+"=", ptr); err != nil {
+			return "", fmt.Errorf("Buildstr: %v", err)
+		}
+	}
+
+	return sql.String(), nil
 }
 
 // buildstr 向b写入一条符合 SQL规范的（赋）值串。s为“列名=”或“”。
